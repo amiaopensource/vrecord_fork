@@ -1,0 +1,1466 @@
+#!/usr/bin/env bash
+
+# vrecord
+# Open-source software for capturing a video signal and turning it into a digital file.
+
+SCRIPTNAME=$(basename "${0}")
+SCRIPTDIR=$(dirname "${0}")
+CONFIG_FILE="${HOME}/.${SCRIPTNAME}.conf"
+unset VERSION
+if [[ $(dirname "$(command -v "${0}")") = "/usr/local/bin" ]] ; then
+    VERSION=$(TMP=$(brew info vrecord | grep ".*\*$" | grep -Eo "/vrecord/.* \(") ; echo "${TMP:9:(${#TMP}-11)}")
+fi
+LOGO_PATH="/usr/local/Cellar/vrecord/${VERSION}"
+unset INPUTOPTIONS
+unset MIDDLEOPTIONS
+unset SUFFIX
+unset DURATION
+unset TECHNICIAN
+RUNTYPE="record"
+CAPTURELOGSUFFIX="_ffmpeg_decklink_input.log"
+unset PASHUAINSTALL
+unset EXTRAOUTPUTS
+UNDECLAREDOPTION="Undeclared"
+DEFAULTFONT="/Library/Fonts/Andale Mono.ttf"
+SAT_OUTLIER_THRSHLD=14
+AUD_OUTLIER_THRSHLD=10
+BRNG_OUTLIER_THRSHLD=14
+BREW_PREFIX=$(brew --prefix ffmpegdecklink)
+FFMPEG_DECKLINK=("${BREW_PREFIX}/bin/ffmpeg-dl")
+FFPLAY_DECKLINK=("${BREW_PREFIX}/bin/ffplay-dl")
+MPVOPTS=(--no-osc)
+MPVOPTS+=(--load-scripts=no)
+MPVOPTS+=(--script "${SCRIPTDIR}/qcview.lua")
+MPVOPTS+=(--really-quiet)
+
+if [[ "$("${FFMPEG_DECKLINK[@]}" -version 2>&1 | grep "Library not loaded" >/dev/null)" || ! -f "${FFMPEG_DECKLINK}" || ! -f "${FFPLAY_DECKLINK}" ]] ; then
+    echo "Please reinstall 'ffmpeg-dl':"
+    echo "  brew reinstall amiaopensource/amiaos/ffmpegdecklink --with-sdl2 --with-freetype --with-openjpeg"
+    echo "Exiting."
+    exit 1
+fi
+
+_usage(){
+    cat <<EOF
+${SCRIPTNAME} ${VERSION}
+
+${SCRIPTNAME} will record a file via the Blackmagic SDK and ffmpeg. It is an
+interactive script and will create 10 or 8-bit video files.
+
+Dependencies: cowsay, amiaopensource/amiaos/ffmpegdecklink --with-sdl2
+  --with-freetype --with-openjpeg, mkvtoolnix, mpv, qcli and xmlstarlet
+
+Usage: ${SCRIPTNAME} [ -g | -e | -r | -p | -a | -x | -h ]
+  -g  use the GUI
+  -e  edit the configuration file before recording
+  -r  enable record mode [default]
+  -p  enable passthrough mode where the video signal coming into the
+      computer can be monitored, but not written to a file. Useful for
+      testing equipment and setting up a tape to bars.
+  -a  enable audio passthrough mode. Identical to passthrough except for
+      the addition of audio bars. Note: Will eventually lag and crash if
+      left on too long.
+  -x  reset the configuration: this will replace the default configuration
+      file at '${CONFIG_FILE}' with an empty one.
+  -h  display this help menu
+
+See also the man page: man ${SCRIPTNAME}
+EOF
+}
+
+# local functions
+_get_iso8601(){
+    date +%FT%T
+}
+
+_report(){
+    local RED="$(tput setaf 1)"    # Red      - For Warnings
+    local GREEN="$(tput setaf 2)"  # Green    - For Declarations
+    local BLUE="$(tput setaf 4)"   # Blue     - For Questions
+    local NC="$(tput sgr0)"        # No Color
+    local COLOR=""
+    local STARTMESSAGE=""
+    local ECHOOPT=""
+    OPTIND=1
+    while getopts "qdwstn" opt ; do
+        case "${opt}" in
+            q) COLOR="${BLUE}" ;;                        # question mode, use color blue
+            d) COLOR="${GREEN}" ;;                       # declaration mode, use color green
+            w) COLOR="${RED}" ;;                         # warning mode, use color red
+            s) STARTMESSAGE+=([${SCRIPTNAME}] ) ;;       # prepend scriptname to the message
+            t) STARTMESSAGE+=($(_get_iso8601) '- ' ) ;;  # prepend timestamp to the message
+            n) ECHOOPT="-n" ;;                           # to avoid line breaks after echo
+        esac
+    done
+    shift "$((OPTIND-1))"
+    MESSAGE="${1}"
+    echo ${ECHOOPT} "${COLOR}${STARTMESSAGE[@]}${MESSAGE}${NC}"
+}
+
+_run(){
+    RUN_ERR=""
+    "${@}"
+    _writeingestlog "FFmpeg command" "${*}"
+    RUN_ERR="${?}"
+    if [[ "${RUN_ERR}" != 0 ]] ; then
+        _report -wts "Error: Running: \"${*}\" gave an Error Code - ${RUN_ERR}"
+        _writeingestlog "Error" "Running: \"${*}\" gave an Error Code - ${RUN_ERR}"
+    fi
+}
+
+# command-line options to set media id and original variables
+OPTIND=1
+while getopts ":herpaxg" opt ; do
+    case "${opt}" in
+        h) _usage ; exit 0 ;;
+        e) RUNTYPE="edit" ;;
+        r) RUNTYPE="record" ;;
+        p) RUNTYPE="passthrough" ;;
+        a) RUNTYPE="audiopassthrough" ;;
+        x) RUNTYPE="reset" ;;
+        g) RUNTYPE="GUI" ; GUI=1 ;;
+        *) _report -w "Error: bad option -${OPTARG}" ; _usage ; exit 1 ;;
+    esac
+done
+shift "$((OPTIND-1))"
+
+if [[ -f "${CONFIG_FILE}" ]] ; then
+    . "${CONFIG_FILE}"
+elif [[ "${RUNTYPE}" = "record" || "${RUNTYPE}" = "edit" ]] ; then
+    echo "No configuration file, restarting in edit mode."
+    touch "${CONFIG_FILE}"
+    exec "${SCRIPTNAME}" -e
+fi
+
+# local functions
+_get_decklink_inputs(){
+    DECKLINK_INPUTS=$("${FFMPEG_DECKLINK[@]}" -f decklink -list_devices 1 -i dummy 2>&1 | grep -o "^\[decklink[^\]*][^']*'.*" | cut -d "'" -f2- | sed "s/'$//g")
+    if [[ -z "${DECKLINK_INPUTS}" ]] ; then
+        _report -w "No decklink inputs were found. Running \`${FFMPEG_DECKLINK} -hide_banner -f decklink -list_devices 1 -i dummy\` results in:"
+        DECKLINK_RESULT=$("${FFMPEG_DECKLINK[@]}" -hide_banner -f decklink -list_devices 1 -i dummy)
+        echo "${DECKLINK_RESULT}"
+        _report -w "Please check connections and drivers and try again."
+        exit 1
+    else
+        FIRST_DECKLINK_INPUT="$(echo "${DECKLINK_INPUTS}" | head -n 1 )"
+    fi
+}
+
+_pashua_run() {
+    # Wrapper function for interfacing to Pashua. Written by Carsten
+    # Bluem <carsten@bluem.net> in 10/2003, modified in 12/2003 (including
+    # a code snippet contributed by Tor Sigurdsson), 08/2004 and 12/2004.
+    # Write config file
+
+    # Find Pashua binary. We do search both . and dirname "$0"
+    # , as in a doubleclickable application, cwd is /
+    # BTW, all these quotes below are necessary to handle paths
+    # containing spaces.
+    BUNDLEPATH="Pashua.app/Contents/MacOS/Pashua"
+    MYPATH=$(dirname "$0")
+    for SEARCHPATH in "${MYPATH}/Pashua" "${MYPATH}/${BUNDLEPATH}" "./${BUNDLEPATH}" \
+                      "/Applications/${BUNDLEPATH}" "${HOME}/Applications/${BUNDLEPATH}"
+    do
+        if [ -f "${SEARCHPATH}" -a -x "${SEARCHPATH}" ] ; then
+            PASHUAPATH="${SEARCHPATH}"
+            break
+        fi
+    done
+    if [[ ! "${PASHUAPATH}" ]] ; then
+        echo "Error: Pashua is used to edit vrecord options but is not found."
+        if [[ -z "${PASHUAINSTALL}" ]] ; then
+            echo "Attempting to run: brew cask install pashua"
+            if [[ "${PASHUAINSTALL}" != "Y" ]] ; then
+                brew cask install pashua
+                PASHUAINSTALL="Y"
+                _pashua_run
+            else
+                break 2
+            fi
+        fi
+    else
+        # Get result
+        RESULT=$("${PASHUAPATH}" "${PASHUA_CONFIGFILE}" | sed 's/ /;;;/g')
+        # Parse result
+        for LINE in ${RESULT} ; do
+            KEY=$(echo "${LINE}" | sed 's/^\([^=]*\)=.*$/\1/')
+            VALUE=$(echo "${LINE}" | sed 's/^[^=]*=\(.*\)$/\1/' | sed 's/;;;/ /g')
+            VARNAME="${KEY}"
+            VARVALUE="${VALUE}"
+            eval "${VARNAME}"='${VARVALUE}'
+        done
+    fi
+}
+
+# GUI dialog to set vrecord runtypes
+_master_gui(){
+    GUI_CONF="
+# Set transparency: 0 is transparent, 1 is opaque
+*.transparency=0.95
+# Set window title
+*.title = Welcome to Vrecord!
+# logo
+VRECORD_LOGO.type = image
+VRECORD_LOGO.path = "${LOGO_PATH}"/vrecord_logo.png
+VRECORD_LOGO.x = 0
+VRECORD_LOGO.y = 75
+# Record
+REC_BUTTON.type = button
+REC_BUTTON.label = Record
+REC_BUTTON.x = 15
+REC_BUTTON.y = 35
+# Passthrough
+PASS_BUTTON.type = button
+PASS_BUTTON.label = Passthrough
+PASS_BUTTON.x = 170
+PASS_BUTTON.y = 35
+# Audio Check
+AUDIO_BUTTON.type = button
+AUDIO_BUTTON.label = Audio Check
+AUDIO_BUTTON.x = 335
+AUDIO_BUTTON.y = 35
+# Edit Settings
+EDIT_BUTTON.type = button
+EDIT_BUTTON.label = Edit Settings
+EDIT_BUTTON.x = 495
+EDIT_BUTTON.y = 35
+# Documentation
+DOCUMENTATION_BUTTON.type = button
+DOCUMENTATION_BUTTON.label = Documentation
+DOCUMENTATION_BUTTON.x = 800
+DOCUMENTATION_BUTTON.y = 35
+# Help
+HELP_BUTTON.type = button
+HELP_BUTTON.label = Help
+HELP_BUTTON.x = 675
+HELP_BUTTON.y = 35
+db.type = defaultbutton
+db.label = Exit
+"
+
+    PASHUA_CONFIGFILE=$(/usr/bin/mktemp /tmp/pashua_XXXXXXXXX)
+    echo "${GUI_CONF}" > "${PASHUA_CONFIGFILE}"
+    _pashua_run
+    if [[ "${REC_BUTTON}" = 1 ]] ; then
+        RUNTYPE="record"
+    elif [[ "${PASS_BUTTON}" = 1 ]] ; then
+        RUNTYPE="passthrough"
+    elif [[ "${AUDIO_BUTTON}" = 1 ]] ; then
+        RUNTYPE="audiopassthrough"
+    elif [[ "${EDIT_BUTTON}" = 1 ]] ; then
+        RUNTYPE="edit"
+    elif [[ "${HELP_BUTTON}" = 1 ]] ; then
+        echo -n -e "\033]0;PRESS Q TO EXIT\007" && man vrecord && echo -n -e "\033]0;\007" && _master_gui
+    elif [[ "${DOCUMENTATION_BUTTON}" = 1 ]] ; then
+        open https://github.com/amiaopensource/vrecord#vrecord-documentation && _master_gui
+    # db = default button, set to exit
+    elif [[ "${db}" = 1 ]] ; then
+        echo "Exiting Vrecord. Goodbye!" && exit 0
+    fi
+    if [[ -f "${PASHUA_CONFIGFILE}" ]] ; then
+        rm "${PASHUA_CONFIGFILE}"
+    fi
+}
+
+# relaunch GUI in GUI mode/exit script in terminal mode
+_gui_return(){
+    if [[ "${GUI}" = 1 ]] ; then
+        _master_gui
+    else
+        exit 0
+    fi
+}
+
+# edit mode
+_edit_mode(){
+    PASHUA_CONFIGFILE=$(/usr/bin/mktemp /tmp/pashua_XXXXXXXXX)
+    echo "${CONF}" > "${PASHUA_CONFIGFILE}"
+    _pashua_run
+    rm "${PASHUA_CONFIGFILE}"
+    # cb = cancel button; default button is "OK"
+    if [[ "${cb}" = 0 ]] ; then
+        _duration_check
+        # report back options
+        if [[ -z "${LOGDIR}" ]] ; then
+            LOGDIR="${DIR}"
+            echo "As auxiliary files directory was left blank, logs will be written to recording directory at ${DIR}."
+        fi
+        echo "Variables set:"
+        echo "  DIR = ${DIR}"
+        echo "  LOGDIR = ${LOGDIR}"
+        echo "  CONTAINER_CHOICE = ${CONTAINER_CHOICE}"
+        echo "  VIDEO_INPUT_CHOICE = ${VIDEO_INPUT_CHOICE}"
+        echo "  AUDIO_INPUT_CHOICE = ${AUDIO_INPUT_CHOICE}"
+        echo "  VIDEO_CODEC_CHOICE = ${VIDEO_CODEC_CHOICE}"
+        echo "  VIDEO_BIT_DEPTH_CHOICE = ${VIDEO_BIT_DEPTH_CHOICE}"
+        echo "  AUDIO_MAPPING_CHOICE = ${AUDIO_MAPPING_CHOICE}"
+        echo "  STANDARD_CHOICE = ${STANDARD_CHOICE}"
+        echo "  QCTOOLSXML_CHOICE = ${QCTOOLSXML_CHOICE}"
+        echo "  FRAMEMD5_CHOICE = ${FRAMEMD5_CHOICE}"
+        echo "  EMBED_LOGS_CHOICE = ${EMBED_LOGS_CHOICE}"
+        echo "  PLAYBACKVIEW_CHOICE = ${PLAYBACKVIEW_CHOICE}"
+        echo "  DURATION = ${DURATION}"
+        echo "  TECHNICIAN = ${TECHNICIAN}"
+        if [[ "${INVERT_PHASE}" = 1 ]] ; then
+            echo -e " \033[101mWARNING: Option to invert phase of second audio channel has been selected\033[0m"
+        fi
+        if [ "${VIDEO_CODEC_CHOICE}" = "FFV1 version 3" -a "${CONTAINER_CHOICE}" = "MXF" ] ; then
+            echo -e " \033[101mWARNING: Incompatible video codecs and CONTAINERs have been selected\033[0m"
+        elif [ "${VIDEO_CODEC_CHOICE}" = "ProRes" -a "${CONTAINER_CHOICE}" = "MXF" ] ; then
+            echo -e " \033[101mWARNING: Incompatible video codecs and CONTAINERs have been selected\033[0m"
+        fi
+        if [ "${EMBED_LOGS_CHOICE}" = "Yes" -a "${CONTAINER_CHOICE}" != "Matroska" ] ; then
+            _report -w "WARNING: Logs cannot be embedded in non-Matroska files. This vrecord session will generate logs in ${LOGDIR}, but will not embed them in your video file."
+        fi
+        echo ""
+        # write config file
+        cat > "${CONFIG_FILE}" << EOF
+#${SCRIPTNAME} config file
+${CONFIG_COMMENT}
+${VIDEO_INPUT_CHOICE_COMMENT}
+VIDEO_INPUT_CHOICE="${VIDEO_INPUT_CHOICE}"
+
+${AUDIO_INPUT_CHOICE_COMMENT}
+AUDIO_INPUT_CHOICE="${AUDIO_INPUT_CHOICE}"
+
+${CONTAINER_CHOICE_COMMENT}
+CONTAINER_CHOICE="${CONTAINER_CHOICE}"
+
+${VIDEO_CODEC_CHOICE_COMMENT}
+VIDEO_CODEC_CHOICE="${VIDEO_CODEC_CHOICE}"
+
+${VIDEO_BIT_DEPTH_CHOICE_COMMENT}
+VIDEO_BIT_DEPTH_CHOICE="${VIDEO_BIT_DEPTH_CHOICE}"
+
+${AUDIO_MAPPING_CHOICE_COMMENT}
+AUDIO_MAPPING_CHOICE="${AUDIO_MAPPING_CHOICE}"
+
+${STANDARD_CHOICE_COMMENT}
+STANDARD_CHOICE="${STANDARD_CHOICE}"
+
+${QCTOOLSXML_CHOICE_COMMENT}
+QCTOOLSXML_CHOICE="${QCTOOLSXML_CHOICE}"
+
+${FRAMEMD5_CHOICE_COMMENT}
+FRAMEMD5_CHOICE="${FRAMEMD5_CHOICE}"
+
+${EMBED_LOGS_CHOICE_COMMENT}
+EMBED_LOGS_CHOICE="${EMBED_LOGS_CHOICE}"
+
+${PLAYBACKVIEW_CHOICE_COMMENT}
+PLAYBACKVIEW_CHOICE="${PLAYBACKVIEW_CHOICE}"
+
+${DIR_COMMENT}
+DIR="${DIR}"
+LOGDIR="${LOGDIR}"
+
+INVERT_PHASE="${INVERT_PHASE}"
+
+${DURATION_COMMENT}
+DURATION="${DURATION}"
+
+${TECHNICIAN_COMMENT}
+TECHNICIAN="${TECHNICIAN}"
+EOF
+        . "${CONFIG_FILE}"
+    else
+        _report -d "Editing of preferences was canceled by the user."
+    fi
+    if [[ "${GUI}" = 1 ]] ; then
+        _master_gui
+    else
+        RUNTYPE="record"
+        open /Applications/Utilities/Terminal.app
+        _report -nd "Press [q] to quit, [p] to enter passthrough mode or any other key to proceed: "
+        read AFTEREDITRESPONSE
+        if [[ "${AFTEREDITRESPONSE}" = "q" ]] ; then
+            _report -d "Bye then"
+            exit 0
+        elif [[ "${AFTEREDITRESPONSE}" = "p" ]] ; then
+            RUNTYPE="passthrough"
+        fi
+    fi
+}
+
+# passthrough and audiopassthrough modes
+_passthrough_mode(){
+    if [[ "${MEDIA_PLAYER_CHOICE}" = "mpv" ]] ; then
+        "${FFMPEG_DECKLINK}" -v info -nostats "${GRAB_DECKLINK[@]}" 2> /tmp/vrecord_input.log \
+        -map 0 -c copy -f nut - | \
+        mpv "${MPVOPTS[@]}" --title="${WINDOW_NAME}" -
+    else
+        "${FFPLAY_DECKLINK}" -v info -nostats "${GRAB_DECKLINK[@]}" 2> /tmp/vrecord_input.log \
+        -window_title "${WINDOW_NAME}" \
+        -vf "${PLAYBACKFILTER}" -af "channelmap=0|1:stereo"
+    fi
+    _gui_return
+}
+
+_audiopassthrough_mode(){
+    PLAYBACKFILTER="\
+[aid1]asplit=2[z][ao],\
+[z]channelsplit=channel_layout=quad[s1][s2][s3][s4];[s1][s2][s3][s4]amerge=inputs=4,aformat=channel_layouts=quad[zz],\
+[zz]showvolume=t=0:h=17:w=200[xx],\
+[vid1]split=5[a][b][c][d][e],\
+[b]field=top[b1],\
+[c]field=bottom[c1],\
+[b1]${WAVEFORM_FILTER}[b2],\
+[c1]${WAVEFORM_FILTER}[c2],\
+[a][b2][c2]vstack=inputs=3,format=yuv422p[abc1],\
+[d]${VECTORSCOPE_FILTER}[d1],\
+[e]signalstats=out=brng,scale=512:ih[e1],\
+[e1][d1]vstack[de1],\
+[abc1][de1]hstack[abcde1],\
+[abcde1][xx]overlay=10:10[vo]"
+    echo "ESC quit" > ~/.config/mpv/input.conf
+    "${FFMPEG_DECKLINK[@]}" -v info -nostdin -hide_banner -nostats "${INPUTOPTIONS[@]}" "${GRAB_DECKLINK[@]}" -map 0 -c copy -f nut - 2> /tmp/vrecord_input.log | \
+        mpv - --title="${WINDOW_NAME}" -lavfi-complex "${PLAYBACKFILTER}"
+    _gui_return
+}
+
+# check validity of duration value
+_duration_check(){
+    # Sets up function to verify validity of duration settings
+    if [[ -n "${DURATION}" ]] ; then
+        if ! [[ "${DURATION}" =~ ^$|^[0-9]+$|^[0-9]+\.[0-9]*$|^\.[0-9]+$ ]] ; then
+            _report -w "Illegal value for recording time. Input must only be numbers."
+            exit 1
+        fi
+        if (( $(bc <<< "${DURATION} == 0") )) ; then
+            _report -w "A recording duration of zero is invalid."
+            exit 1
+        fi
+    fi
+}
+
+# create a capture log of decisions made in vrecord
+_writeingestlog(){
+    if [[ "${INGESTLOG}" ]] ; then
+        KEY="${1}"
+        VALUE="${2}"
+        # need to add yaml style escaping
+        echo "${KEY}: ${VALUE}" >> "${INGESTLOG}"
+    else
+        _report -wt "The _writeingestlog function was called, but the ingestlog file (${INGESTLOG}) is not declared."
+    fi
+}
+
+# set vrecord options as specified by user
+_lookup_video_input(){
+    case "${1}" in
+        "Composite") VIDEO_INPUT="composite" ;;
+        "SDI")       VIDEO_INPUT="sdi" ;;
+        "Component") VIDEO_INPUT="component" ;;
+        "S-Video")   VIDEO_INPUT="s_video" ;;
+        "quit")      _report -d "Bye then" ; exit 0 ;;
+        *)           _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_lookup_audio_input(){
+    case "${1}" in
+        "Analog")                  AUDIO_INPUT="analog" ;;
+        "SDI Embedded Audio")      AUDIO_INPUT="embedded" ;;
+        "Digital Audio (AES/EBU)") AUDIO_INPUT="aes_ebu" ;;
+        "quit")                    _report -d "Bye then" ; exit 0 ;;
+        *)                         _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_lookup_container(){
+    case "${1}" in
+        "QuickTime")
+            EXTENSION="mov"
+            MIDDLEOPTIONS+=(-movflags write_colr)
+            FORMAT="mov"
+            ;;
+        "Matroska")
+            EXTENSION="mkv"
+            MIDDLEOPTIONS+=(-f_strict unofficial)
+            FORMAT="matroska"
+            ;;
+        "AVI")
+            EXTENSION="avi"
+            FORMAT="avi"
+            ;;
+        "MXF")
+            EXTENSION="mxf"
+            FORMAT="mxf"
+            ;;
+        "quit") _report -d "Bye then" ; exit 0 ;;
+        *) _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_lookup_video_codec(){
+    case "${1}" in
+        "Uncompressed Video")
+            if [[ "${PIXEL_FORMAT}" = "yuv422p10" ]] ; then
+                CODECNAME="Uncompressed 10-bit 4:2:2"
+                MIDDLEOPTIONS+=(-c:v v210)
+            elif [[ "${PIXEL_FORMAT}" = "uyvy422" ]] ; then
+                CODECNAME="Uncompressed 8-bit 4:2:2"
+                MIDDLEOPTIONS+=(-c:v rawvideo -pix_fmt uyvy422 -tag:v 2vuy)
+            fi
+            ;;
+        "FFV1 version 3")
+            CODECNAME="FFV1 version 3"
+            MIDDLEOPTIONS+=(-c:v ffv1 -level 3 -g 1 -slices 16 -slicecrc 1)
+            SUFFIX="_ffv1"
+            ;;
+        "JPEG2000")
+            CODECNAME="JPEG2000"
+            MIDDLEOPTIONS+=(-c:v libopenjpeg)
+            SUFFIX="_j2k"
+            ;;
+        "ProRes")
+            CODECNAME="Apple ProRes 422 HQ"
+            MIDDLEOPTIONS+=(-c:v prores_ks -profile:v 3 -flags +ilme+ildct)
+            SUFFIX="_prores"
+            ;;
+        "quit") _report -d "Bye then" ; exit 0 ;;
+        *) _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_lookup_pixel_format(){
+    case "${1}" in
+        "10 bit") PIXEL_FORMAT="yuv422p10" ;;
+        "8 bit")  PIXEL_FORMAT="uyvy422" ;;
+        "quit")   _report -d "Bye then" ; exit 0 ;;
+        *)        _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_lookup_audio_mapping(){
+    case "${1}" in
+        "2 Stereo Tracks (Channels 1 & 2 -> 1st Track Stereo, Channels 3 & 4 -> 2nd Track Stereo)")
+            AUDIOMAP="[0:a:0]pan=stereo| c0=c0 | c1=${PHASE_VALUE}c1[stereo1];[0:a:0]pan=stereo| c0=c2 | c1=c3[stereo2]"
+            MAP1V="[stereo1]"
+            MAP2V="[stereo2]"
+            ;;
+        "1 Stereo Track (From Channels 1 & 2)")
+            AUDIOMAP="[0:a:0]pan=stereo| c0=c0 | c1=${PHASE_VALUE}c1[stereo1]"
+            MAP1V="[stereo1]"
+            MAP2V=""
+            ;;
+        "1 Stereo Track (From Channels 3 & 4)")
+            AUDIOMAP="[0:a:0]pan=stereo| c0=c2 | c1=${PHASE_VALUE}c3[stereo1]"
+            MAP1V="[stereo1]"
+            MAP2V=""
+            ;;
+        "Channel 1 -> 1st Track Mono, Channel 2 -> 2nd Track Mono")
+            AUDIOMAP="[0:a:0]pan=mono| c0=c0[mono1];[0:a:0]pan=mono| c0=${PHASE_VALUE}c1[mono2]"
+            MAP1V="[mono1]"
+            MAP2V="[mono2]"
+            ;;
+        "Channel 2 -> 1st Track Mono, Channel 1 -> 2nd Track Mono")
+            AUDIOMAP="[0:a:0]pan=mono| c0=${PHASE_VALUE}c1[mono1];[0:a:0]pan=mono| c0=c0[mono2]"
+            MAP1V="[mono1]"
+            MAP2V="[mono2]"
+            ;;
+        "Channel 1 -> Single Track Mono")
+            AUDIOMAP="[0:a:0]pan=mono| c0=c0[mono1]"
+            MAP1V="[mono1]"
+            ;;
+        "Channel 2 -> Single Track Mono")
+            AUDIOMAP="[0:a:0]pan=mono| c0=c1[mono1]"
+            MAP1V="[mono1]"
+            ;;
+        "quit") _report -d "Bye then" ; exit 0 ;;
+        *) _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+    if [[ -n "${MAP1V}" ]] ; then
+        AUDIO_CHANNEL_MAP+=(-map "${MAP1V}")
+    fi
+    if [[ -n "${MAP2V}" ]] ; then
+        AUDIO_CHANNEL_MAP+=(-map "${MAP2V}")
+    fi
+}
+
+_lookup_standard(){
+    case "${1}" in
+        "NTSC")
+            STANDARD="ntsc"
+            DECKLINK_FPS="30000/1001"
+            RECORDINGFILTER="setfield=bff,setsar=40/27,setdar=4/3"
+            MIDDLEOPTIONS+=(-color_primaries smpte170m)
+            MIDDLEOPTIONS+=(-color_trc bt709)
+            MIDDLEOPTIONS+=(-colorspace smpte170m)
+            ;;
+        "PAL")
+            STANDARD="pal "
+            DECKLINK_FPS="25000/1000"
+            RECORDINGFILTER="setfield=tff,setsar=16/15,setdar=4/3"
+            MIDDLEOPTIONS+=(-color_primaries bt470bg)
+            MIDDLEOPTIONS+=(-color_trc bt709)
+            MIDDLEOPTIONS+=(-colorspace bt470bg)
+            ;;
+        "quit") _report -d "Bye then" ; exit 0 ;;
+        *) _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_lookup_qctoolsxml(){
+    case "${1}" in
+        "Yes, after recording"|"Yes, concurrent with recording"|"No") ;;
+        "quit") _report -d "Bye then" ; exit 0 ;;
+        *) _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_yes_or_no(){
+    case "${1}" in
+        "Yes"|"No") ;;
+        "quit") _report -d "Bye then" ; exit 0 ;;
+        *) _report -w "Error: Not a valid option, select a valid number." ; return 1 ;;
+    esac
+}
+
+_frames_to_hhmmss(){
+    H=$(echo "${i} / (60 * 60 * ${DECKLINK_FPS})" | bc)
+    M=$(echo "(${i} - (${H}*60 * 60 * ${DECKLINK_FPS})) / (60 * ${DECKLINK_FPS})" | bc)
+    S="$(echo "scale=3;(${i} - (${H}*60 * 60 * ${DECKLINK_FPS})-($M*60*${DECKLINK_FPS})) / (${DECKLINK_FPS})" | bc)"
+    Ss=$(echo "${S}" | cut -d. -f1)
+    Sm=$(echo "${S}" | cut -d. -f2)
+    printf "%02d:%02d:%02d.%03d\n" "${H}" "${M}" "${Ss}" "${Sm}"
+}
+
+# set up drawtext.txt files for Visual + Numerical playback view
+_set_up_drawtext(){
+    echo -e "%{pts:hms}
+
+  Y
+ Low  %{metadata:lavfi.signalstats.YLOW}
+ Avg  %{metadata:lavfi.signalstats.YAVG}
+ High %{metadata:lavfi.signalstats.YHIGH}
+ Diff %{metadata:lavfi.signalstats.YDIF}
+
+  U
+ Low  %{metadata:lavfi.signalstats.ULOW}
+ Avg  %{metadata:lavfi.signalstats.UAVG}
+ High %{metadata:lavfi.signalstats.UHIGH}
+ Diff %{metadata:lavfi.signalstats.UDIF}
+
+  V
+ Low  %{metadata:lavfi.signalstats.VLOW}
+ Avg  %{metadata:lavfi.signalstats.VAVG}
+ High %{metadata:lavfi.signalstats.VHIGH}
+ Diff %{metadata:lavfi.signalstats.VDIF}
+
+  SAT
+ Low  %{metadata:lavfi.signalstats.SATLOW}
+ Avg  %{metadata:lavfi.signalstats.SATAVG}
+ High %{metadata:lavfi.signalstats.SATHIGH}
+ " > /tmp/drawtext.txt
+
+    echo -e "
+ 
+ 
+ 
+ 
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ HUE(med) %{metadata:lavfi.signalstats.HUEMED}
+ HUE(avg) %{metadata:lavfi.signalstats.HUEAVG}
+ TOUT     %{metadata:lavfi.signalstats.TOUT}
+ VREP     %{metadata:lavfi.signalstats.VREP}
+
+
+" > /tmp/drawtext2.txt
+    echo -e "
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+BRNG
+%{metadata:lavfi.signalstats.BRNG}
+" > /tmp/drawtext3.txt
+}
+
+# select playback view
+WAVEFORM_FILTER="\
+format=yuv422p,\
+waveform=intensity=0.1:mode=column:mirror=1:c=1:f=lowpass:e=instant:graticule=green:flags=numbers+dots"
+VECTORSCOPE_FILTER="\
+format=yuv422p,\
+vectorscope=i=0.04:mode=color2:c=1:envelope=instant:graticule=green:flags=name,\
+scale=512:512,\
+drawbox=w=9:h=9:t=1:x=128-3:y=512-452-5:c=sienna@0.8,\
+drawbox=w=9:h=9:t=1:x=160-3:y=512-404-5:c=sienna@0.8,\
+drawbox=w=9:h=9:t=1:x=192-3:y=512-354-5:c=sienna@0.8,\
+drawbox=w=9:h=9:t=1:x=224-3:y=512-304-5:c=sienna@0.8,\
+drawgrid=w=32:h=32:t=1:c=white@0.1,\
+drawgrid=w=256:h=256:t=1:c=white@0.2"
+
+_lookup_playbackview(){
+    case "${1}" in
+        "Quality Control View (mpv)")
+            MEDIA_PLAYER_CHOICE="mpv"
+            ;;
+        "Broadcast Range Visual")
+            PLAYBACKFILTER="\
+split=5[a][b][c][d][e];\
+[b]field=top[b1];\
+[c]field=bottom[c1];\
+[b1]${WAVEFORM_FILTER}[b2];\
+[c1]${WAVEFORM_FILTER}[c2];\
+[a][b2][c2]vstack=inputs=3,format=yuv422p[abc1];\
+[d]${VECTORSCOPE_FILTER}[d1];\
+[e]signalstats=out=brng,scale=512:ih[e1];\
+[e1][d1]vstack[de1];\
+[abc1][de1]hstack"
+            ;;
+        "Full Range Visual")
+            PLAYBACKFILTER="\
+split=5[a][b][c][d][e];\
+[b]field=top[b1];\
+[c]field=bottom[c1];\
+[b1]${WAVEFORM_FILTER}[b2];\
+[c1]${WAVEFORM_FILTER}[c2];\
+[a][b2][c2]vstack=inputs=3,format=yuv422p[abc1];\
+[d]${VECTORSCOPE_FILTER}[d1];\
+[e]format=yuv444p,pseudocolor=if(between(1\,val\,amax)+between(val\,254\,amax)\,65\,-1):if(between(1\,val\,amax)+between(val\,254\,amax)\,100\,-1):if(between(1\,val\,amax)+between(val\,254\,amax)\,212\,-1),scale=512:ih[e1];\
+[e1][d1]vstack[de1];\
+[abc1][de1]hstack"
+          ;;
+      "Visual + Numerical")
+          PLAYBACKFILTER="\
+split=7[a][b][c][d][e][f][g];\
+[b]field=top[b1];\
+[c]field=bottom[c1];\
+[b1]${WAVEFORM_FILTER}[b2];\
+[c1]${WAVEFORM_FILTER}[c2];\
+[a][b2][c2]vstack=inputs=3,format=yuv422p[abc1];\
+[d]${VECTORSCOPE_FILTER}[d1];\
+[e]signalstats=out=brng,scale=512:ih[e1];\
+[e1][d1]vstack[de1];\
+[f]signalstats=stat=brng+vrep+tout,format=yuv422p,geq=lum=60:cb=128:cr=128,\
+scale=180:ih+512,setsar=1/1,\
+drawtext=fontcolor=white:fontsize=22:\
+fontfile=${DEFAULTFONT}:textfile=/tmp/drawtext.txt,\
+drawtext=fontcolor=white:fontsize=17:\
+fontfile=${DEFAULTFONT}:textfile=/tmp/drawtext2.txt,\
+drawtext=fontcolor=white:fontsize=52:\
+fontfile=${DEFAULTFONT}:textfile=/tmp/drawtext3.txt[f1];\
+[f1][abc1][de1]hstack=inputs=3[abcdef1];\
+[g]scale=iw+512+180:82,format=yuv422p,geq=lum=60:cb=128:cr=128,drawtext=fontcolor=white:fontsize=22:\
+fontfile=${DEFAULTFONT}:textfile=/tmp/vrecord_input.log:\
+reload=1:y=82-th[g1];\
+[abcdef1][g1]vstack"
+            ;;
+      "Color Matrix")
+          HUE=20
+          SAT=0.3
+          PLAYBACKFILTER="\
+scale=iw/4:ih/4,\
+split=9[x][hm][hp][sm][sp][hmsm][hmsp][hpsm][hpsp];\
+[hm]hue=h=-${HUE}[hm1];\
+[hp]hue=h=${HUE}[hp1];\
+[sm]hue=s=1-${SAT}[sm1];\
+[sp]hue=s=1+${SAT}[sp1];\
+[hmsm]hue=h=-${HUE}:s=1-${SAT}[hmsm1];\
+[hmsp]hue=h=-${HUE}:s=1+${SAT}[hmsp1];\
+[hpsm]hue=h=${HUE}:s=1-${SAT}[hpsm1];\
+[hpsp]hue=h=${HUE}:s=1+${SAT}[hpsp1];\
+[hpsm1][hp1][hpsp1]hstack=3[top];\
+[sm1][x][sp1]hstack=3[mid];\
+[hmsm1][hm1][hmsp1]hstack=3[bottom];\
+[top][mid][bottom]vstack=3"
+           ;;
+      "Bit Planes")
+          if [[ "${PIXEL_FORMAT}" == "uyvy422" ]] ; then
+              BITS=8
+              SPLIT="8[b0][b1][b2][b3][b4][b5][b6][b7]"
+              STACK="[b0c][b1c][b2c][b3c][b4c][b5c][b6c][b7c]hstack=8,format=yuv444p,drawgrid=w=iw/8:h=ih:t=2:c=green@0.5"
+          elif [[ "${PIXEL_FORMAT}" == "yuv422p10" ]] ; then
+              BITS=10
+              SPLIT="10[b0][b1][b2][b3][b4][b5][b6][b7][b8][b9]"
+              STACK="\
+[b8]bitplanenoise=bitplane=2,crop=iw/10:ih:(iw/10)*8:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-9))*pow(2\\,9),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.2}:y=0:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.2}:y=20:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.2}:y=40:fontcolor=white:fontsize=20[b8c];\
+[b9]bitplanenoise=bitplane=1,crop=iw/10:ih:(iw/10)*9:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-10))*pow(2\\,10),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.1}:y=0:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.1}:y=20:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.1}:y=40:fontcolor=silver:fontsize=20[b9c];\
+[b0c][b1c][b2c][b3c][b4c][b5c][b6c][b7c][b8c][b9c]hstack=10,format=yuv444p,drawgrid=w=iw/10:h=ih:t=2:c=green@0.5"
+          fi
+          PLAYBACKFILTER="\
+format=yuv420p10le|yuv422p10le|yuv444p10le|yuv440p10le,split=${SPLIT};\
+[b0]bitplanenoise=bitplane=10,crop=iw/${BITS}:ih:(iw/${BITS})*0:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-1))*pow(2\\,1),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.10}:y=0:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.10}:y=20:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.10}:y=40:fontcolor=white:fontsize=20[b0c];\
+[b1]bitplanenoise=bitplane=9,crop=iw/${BITS}:ih:(iw/${BITS})*1:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-2))*pow(2\\,2),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.9}:y=0:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.9}:y=20:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.9}:y=40:fontcolor=silver:fontsize=20[b1c];\
+[b2]bitplanenoise=bitplane=8,crop=iw/${BITS}:ih:(iw/${BITS})*2:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-3))*pow(2\\,3),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.8}:y=0:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.8}:y=20:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.8}:y=40:fontcolor=white:fontsize=20[b2c];\
+[b3]bitplanenoise=bitplane=7,crop=iw/${BITS}:ih:(iw/${BITS})*3:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-4))*pow(2\\,4),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.7}:y=0:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.7}:y=20:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.7}:y=40:fontcolor=silver:fontsize=20[b3c];\
+[b4]bitplanenoise=bitplane=6,crop=iw/${BITS}:ih:(iw/${BITS})*4:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-5))*pow(2\\,5),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.6}:y=0:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.6}:y=20:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.6}:y=40:fontcolor=white:fontsize=20[b4c];\
+[b5]bitplanenoise=bitplane=5,crop=iw/${BITS}:ih:(iw/${BITS})*5:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-6))*pow(2\\,6),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.5}:y=0:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.5}:y=20:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.5}:y=40:fontcolor=silver:fontsize=20[b5c];\
+[b6]bitplanenoise=bitplane=4,crop=iw/${BITS}:ih:(iw/${BITS})*6:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-7))*pow(2\\,7),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.4}:y=0:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.4}:y=20:fontcolor=white:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.4}:y=40:fontcolor=white:fontsize=20[b6c];\
+[b7]bitplanenoise=bitplane=3,crop=iw/${BITS}:ih:(iw/${BITS})*7:0,lutyuv=u=(maxval/2):v=(maxval/2):y=bitand(val\\,pow(2\\,10-8))*pow(2\\,8),pad=iw:ih+64:0:64,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.0.3}:y=0:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.1.3}:y=20:fontcolor=silver:fontsize=20,drawtext=fontfile=${DEFAULTFONT}:text=%{metadata\\\:lavfi.bitplanenoise.2.3}:y=40:fontcolor=silver:fontsize=20[b7c];\
+${STACK}" ;;
+        "quit") _report -d "Bye then" ; exit 0 ;;
+        *) _report -w "Error: Not a valid option, select a valid number or [q] to quit." ; return 1 ;;
+    esac
+}
+
+# GUI dialog to set vrecord options (in edit mode)
+CONF="
+# Set transparency: 0 is transparent, 1 is opaque
+*.transparency=0.95
+# Set window title
+*.title = vrecord configuration
+# INTRO text
+INTRO.x = 20
+INTRO.y = 480
+INTRO.width = 500
+INTRO.type = text
+INTRO.text = Set file recording options. Leave the option as \"${UNDECLAREDOPTION}\" to be prompted later.
+# recording directory
+DIR.x = 20
+DIR.y = 440
+DIR.type = openbrowser
+DIR.label = Select a recording directory.
+DIR.default = ${DIR}
+DIR.filetype = directory
+DIR.width=400
+# logs directory
+LOGDIR.x = 20
+LOGDIR.y = 395
+LOGDIR.type = openbrowser
+LOGDIR.label = Select a directory for auxiliary files (leave blank to match the recording directory).
+LOGDIR.default = ${LOGDIR}
+LOGDIR.filetype = directory
+LOGDIR.width=400
+LOGDIR.tooltip = select the directory for automatically generated logs and checksums
+# video input
+VIDEO_INPUT_CHOICE.x = 20
+VIDEO_INPUT_CHOICE.y = 280
+VIDEO_INPUT_CHOICE.type = radiobutton
+VIDEO_INPUT_CHOICE.label = Select Video Input
+VIDEO_INPUT_CHOICE.default = ${VIDEO_INPUT_CHOICE}
+VIDEO_INPUT_CHOICE.option = ${UNDECLAREDOPTION}
+VIDEO_INPUT_CHOICE.option = Composite
+VIDEO_INPUT_CHOICE.option = SDI
+VIDEO_INPUT_CHOICE.option = Component
+VIDEO_INPUT_CHOICE.option = S-Video
+# audio input
+AUDIO_INPUT_CHOICE.x = 20
+AUDIO_INPUT_CHOICE.y = 150
+AUDIO_INPUT_CHOICE.type = radiobutton
+AUDIO_INPUT_CHOICE.label = Select Audio Input
+AUDIO_INPUT_CHOICE.default = ${AUDIO_INPUT_CHOICE}
+AUDIO_INPUT_CHOICE.option = ${UNDECLAREDOPTION}
+AUDIO_INPUT_CHOICE.option = Analog
+AUDIO_INPUT_CHOICE.option = SDI Embedded Audio
+AUDIO_INPUT_CHOICE.option = Digital Audio (AES/EBU)
+# recording file format
+CONTAINER_CHOICE.x = 170
+CONTAINER_CHOICE.y = 280
+CONTAINER_CHOICE.type = radiobutton
+CONTAINER_CHOICE.label = Select File Format
+CONTAINER_CHOICE.default = ${CONTAINER_CHOICE}
+CONTAINER_CHOICE.option = ${UNDECLAREDOPTION}
+CONTAINER_CHOICE.option = QuickTime
+CONTAINER_CHOICE.option = Matroska
+CONTAINER_CHOICE.option = AVI
+CONTAINER_CHOICE.option = MXF
+# video codec
+VIDEO_CODEC_CHOICE.x = 300
+VIDEO_CODEC_CHOICE.y = 280
+VIDEO_CODEC_CHOICE.type = radiobutton
+VIDEO_CODEC_CHOICE.label = Select Codec for Video
+VIDEO_CODEC_CHOICE.default = ${VIDEO_CODEC_CHOICE}
+VIDEO_CODEC_CHOICE.option = ${UNDECLAREDOPTION}
+VIDEO_CODEC_CHOICE.option = Uncompressed Video
+VIDEO_CODEC_CHOICE.option = FFV1 version 3
+VIDEO_CODEC_CHOICE.option = JPEG2000
+VIDEO_CODEC_CHOICE.option = ProRes
+# video bit depth
+VIDEO_BIT_DEPTH_CHOICE.x = 470
+VIDEO_BIT_DEPTH_CHOICE.y = 317
+VIDEO_BIT_DEPTH_CHOICE.type = radiobutton
+VIDEO_BIT_DEPTH_CHOICE.label = Select Video Bit Depth
+VIDEO_BIT_DEPTH_CHOICE.default = ${VIDEO_BIT_DEPTH_CHOICE}
+VIDEO_BIT_DEPTH_CHOICE.option = ${UNDECLAREDOPTION}
+VIDEO_BIT_DEPTH_CHOICE.option = 10 bit
+VIDEO_BIT_DEPTH_CHOICE.option = 8 bit
+# audio mapping
+AUDIO_MAPPING_CHOICE.x = 200
+AUDIO_MAPPING_CHOICE.y = 200
+AUDIO_MAPPING_CHOICE.type = popup
+AUDIO_MAPPING_CHOICE.label = Select Audio Channel Mapping
+AUDIO_MAPPING_CHOICE.default = ${AUDIO_MAPPING_CHOICE}
+AUDIO_MAPPING_CHOICE.option = ${UNDECLAREDOPTION}
+AUDIO_MAPPING_CHOICE.option = 2 Stereo Tracks (Channels 1 & 2 -> 1st Track Stereo, Channels 3 & 4 -> 2nd Track Stereo)
+AUDIO_MAPPING_CHOICE.option = 1 Stereo Track (From Channels 1 & 2)
+AUDIO_MAPPING_CHOICE.option = 1 Stereo Track (From Channels 3 & 4)
+AUDIO_MAPPING_CHOICE.option = Channel 1 -> 1st Track Mono, Channel 2 -> 2nd Track Mono
+AUDIO_MAPPING_CHOICE.option = Channel 2 -> 1st Track Mono, Channel 1 -> 2nd Track Mono
+AUDIO_MAPPING_CHOICE.option = Channel 1 -> Single Track Mono
+AUDIO_MAPPING_CHOICE.option = Channel 2 -> Single Track Mono
+# video standard
+STANDARD_CHOICE.x = 470
+STANDARD_CHOICE.y = 230
+STANDARD_CHOICE.type = radiobutton
+STANDARD_CHOICE.label = Select Television Standard
+STANDARD_CHOICE.default = ${STANDARD_CHOICE}
+STANDARD_CHOICE.option = ${UNDECLAREDOPTION}
+STANDARD_CHOICE.option = NTSC
+STANDARD_CHOICE.option = PAL
+# qctools xml 
+QCTOOLSXML_CHOICE.x = 660
+QCTOOLSXML_CHOICE.y = 317
+QCTOOLSXML_CHOICE.type = radiobutton
+QCTOOLSXML_CHOICE.label = Create QCTools XML?
+QCTOOLSXML_CHOICE.default = ${QCTOOLSXML_CHOICE}
+QCTOOLSXML_CHOICE.option = ${UNDECLAREDOPTION}
+QCTOOLSXML_CHOICE.option = Yes, after recording
+QCTOOLSXML_CHOICE.option = Yes, concurrent with recording
+QCTOOLSXML_CHOICE.option = No
+# frame md5 
+FRAMEMD5_CHOICE.x = 660
+FRAMEMD5_CHOICE.y = 230
+FRAMEMD5_CHOICE.type = radiobutton
+FRAMEMD5_CHOICE.label = Create frame-level MD5 checksums? (recommended)
+FRAMEMD5_CHOICE.default = ${FRAMEMD5_CHOICE}
+FRAMEMD5_CHOICE.option = ${UNDECLAREDOPTION}
+FRAMEMD5_CHOICE.option = Yes
+FRAMEMD5_CHOICE.option = No
+# embed logs choice
+EMBED_LOGS_CHOICE.x = 660
+EMBED_LOGS_CHOICE.y = 143
+EMBED_LOGS_CHOICE.type = radiobutton
+EMBED_LOGS_CHOICE.label = Embed digitization logs in video file? (Matroska only)
+EMBED_LOGS_CHOICE.default = ${EMBED_LOGS_CHOICE}
+EMBED_LOGS_CHOICE.option = ${UNDECLAREDOPTION}
+EMBED_LOGS_CHOICE.option = Yes
+EMBED_LOGS_CHOICE.option = No
+# playbackview choice
+PLAYBACKVIEW_CHOICE.x = 20
+PLAYBACKVIEW_CHOICE.y = 3
+PLAYBACKVIEW_CHOICE.type = popup
+PLAYBACKVIEW_CHOICE.label = Select View
+PLAYBACKVIEW_CHOICE.default = ${PLAYBACKVIEW_CHOICE}
+PLAYBACKVIEW_CHOICE.option = ${UNDECLAREDOPTION}
+PLAYBACKVIEW_CHOICE.option = Quality Control View (mpv)
+PLAYBACKVIEW_CHOICE.option = Broadcast Range Visual
+PLAYBACKVIEW_CHOICE.option = Full Range Visual
+PLAYBACKVIEW_CHOICE.option = Visual + Numerical
+PLAYBACKVIEW_CHOICE.option = Color Matrix
+PLAYBACKVIEW_CHOICE.option = Bit Planes
+# duration
+DURATION.x = 20
+DURATION.y = 60
+DURATION.type = combobox
+DURATION.label = Set recording time (integer or decimal) in minutes.
+DURATION.tooltip = Leave blank for indefinite recording time
+DURATION.default = ${DURATION}
+DURATION.option = 23
+DURATION.option = 33
+DURATION.option = 63
+DURATION.option = 93
+# technician name
+TECHNICIAN.x = 350
+TECHNICIAN.y = 55
+TECHNICIAN.type = textbox
+TECHNICIAN.height = 30
+TECHNICIAN.label = Enter the name of the person digitizing this tape.
+# Add a cancel button with default label
+cb.type=cancelbutton
+# Add option to invert second channel
+INVERT_PHASE.x = 410
+INVERT_PHASE.y = 0
+INVERT_PHASE.type = checkbox
+INVERT_PHASE.label = Invert Second Channel of Audio
+INVERT_PHASE.default = ${INVERT_PHASE}
+WARNING.x = 350
+WARNING.y = 0
+WARNING.type = text
+WARNING.default = WARNING: Do not use this option unless required
+"
+
+# list of selections for each vrecord option
+VIDEO_INPUT_OPTIONS=("Composite" "SDI" "Component" "S-Video" "quit")
+AUDIO_INPUT_OPTIONS=("Analog" "SDI Embedded Audio" "Digital Audio (AES/EBU)" "quit")
+CONTAINER_OPTIONS=("QuickTime" "Matroska" "AVI" "MXF" "quit")
+VIDEO_CODEC_OPTIONS=("Uncompressed Video" "FFV1 version 3" "JPEG2000" "ProRes" "quit")
+VIDEO_BITDEPTH_OPTIONS=("10 bit" "8 bit" "quit")
+CHANNEL_MAPPING_OPTIONS=("2 Stereo Tracks (Channels 1 & 2 -> 1st Track Stereo, Channels 3 & 4 -> 2nd Track Stereo)" "1 Stereo Track (From Channels 1 & 2)" "1 Stereo Track (From Channels 3 & 4)" "Channel 1 -> 1st Track Mono, Channel 2 -> 2nd Track Mono" "Channel 2 -> 1st Track Mono, Channel 1 -> 2nd Track Mono" "Channel 1 -> Single Track Mono" "Channel 2 -> Single Track Mono" "quit")
+STANDARD_OPTIONS=("NTSC" "PAL" "quit")
+QCTOOLSXML_OPTIONS=("Yes, after recording" "Yes, concurrent with recording" "No" "quit")
+FRAMEMD5_OPTIONS=("Yes" "No" "quit")
+EMBED_LOGS_OPTIONS=("Yes" "No" "quit")
+PLAYBACKVIEW_OPTIONS=("Quality Control View (mpv)" "Broadcast Range Visual" "Full Range Visual" "Visual + Numerical" "Color Matrix" "Bit Planes" "quit")
+
+# comments to be printed to vrecord config file; must be commented (start with #)
+CONFIG_COMMENT="# Set each value to empty quotes (like \"\") to prompt during run, or set to a provided option."
+DIR_COMMENT="#Set dir to the preferred recording directory or leave blank to request each run:"
+VIDEO_INPUT_CHOICE_COMMENT="# Set VIDEO_INPUT_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${VIDEO_INPUT_OPTIONS[@]}")"
+AUDIO_INPUT_CHOICE_COMMENT="#Set AUDIO_INPUT_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${AUDIO_INPUT_OPTIONS[@]}")"
+CONTAINER_CHOICE_COMMENT="#Set CONTAINER_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${CONTAINER_OPTIONS[@]}")"
+VIDEO_CODEC_CHOICE_COMMENT="#Set VIDEO_CODEC_CHOICE to one of these valid options or leave blank to request each run: $(printf "\"%s\" " "${VIDEO_CODEC_OPTIONS[@]}")"
+VIDEO_BIT_DEPTH_CHOICE_COMMENT="#Set VIDEO_BIT_DEPTH_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${VIDEO_BITDEPTH_OPTIONS[@]}")"
+AUDIO_MAPPING_CHOICE_COMMENT="#Set AUDIO_MAPPING_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${CHANNEL_MAPPING_OPTIONS[@]}")"
+STANDARD_CHOICE_COMMENT="#Set STANDARD_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${STANDARD_OPTIONS[@]}")"
+QCTOOLSXML_CHOICE_COMMENT="#Set QCTOOLSXML_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${QCTOOLSXML_OPTIONS[@]}")"
+FRAMEMD5_CHOICE_COMMENT="#Set FRAMEMD5_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${FRAMEMD5_OPTIONS[@]}")"
+EMBED_LOGS_CHOICE_COMMENT="#Set embed_choice to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${EMBED_LOGS_OPTIONS[@]}")"
+PLAYBACKVIEW_CHOICE_COMMENT="#Set PLAYBACKVIEW_CHOICE to one of these valid options or leave blank to request each run:  $(printf "\"%s\" " "${PLAYBACKVIEW_OPTIONS[@]}")"
+DURATION_COMMENT="#Set the recording time as a number (integer or decimal) in minutes."
+TECHNICIAN_COMMENT="#Enter the name of the person digitizing this tape."
+
+# GUI mode + CLI reset, edit modes
+if [[ "${RUNTYPE}" = "GUI" ]] ; then
+    _master_gui
+fi
+if [[ "${RUNTYPE}" = "reset" ]] ; then
+    _report -q -n "Resetting the configuration will clear ${CONFIG_FILE}. Please enter [Y] to confirm: "
+    read RESET_RESPONSE
+    if [[ "${RESET_RESPONSE}" = [Yy] ]] ; then
+        _report -d "Clearing ${CONFIG_FILE}."
+        echo -n "" > "${CONFIG_FILE}"
+        RUNTYPE="edit"
+    else
+        _report -d "Reset aborted. Exiting."
+        exit 0
+    fi
+fi
+while [[ "${RUNTYPE}" = "edit" ]] ; do
+    _edit_mode
+done
+
+open /Applications/Utilities/Terminal.app
+if [[ "${INVERT_PHASE}" = 1 ]] ; then
+    PHASE_VALUE="-1*"
+fi
+
+# terminal dialog for undeclared options (needed to set up passthrough modes)
+if [[ "${VIDEO_INPUT_CHOICE}" && "${VIDEO_INPUT_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_video_input "${VIDEO_INPUT_CHOICE}"
+else
+    _report -q "Which video input are you using?"
+    PS3="Select a video input: "
+    select VIDEO_INPUT_CHOICE in "${VIDEO_INPUT_OPTIONS[@]}" ; do
+        _lookup_video_input "${VIDEO_INPUT_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+if [[ "${AUDIO_INPUT_CHOICE}" && "${AUDIO_INPUT_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_audio_input "${AUDIO_INPUT_CHOICE}"
+else
+    _report -q "Which audio input are you using?"
+    PS3="Select an audio input: "
+    select AUDIO_INPUT_CHOICE in "${AUDIO_INPUT_OPTIONS[@]}" ; do
+        _lookup_audio_input "${AUDIO_INPUT_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+if [[ "${VIDEO_BIT_DEPTH_CHOICE}" && "${VIDEO_BIT_DEPTH_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_pixel_format "${VIDEO_BIT_DEPTH_CHOICE}"
+else
+    _report -q "Which video bit depth?"
+    PS3="Select a video bit depth: "
+    select VIDEO_BIT_DEPTH_CHOICE in "${VIDEO_BITDEPTH_OPTIONS[@]}" ; do
+        _lookup_pixel_format "${VIDEO_BIT_DEPTH_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+if [[ "${AUDIO_MAPPING_CHOICE}" && "${AUDIO_MAPPING_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_audio_mapping "${AUDIO_MAPPING_CHOICE}"
+else
+    _report -q "Which audio mapping?"
+    PS3="Select an audio mapping: "
+    select AUDIO_MAPPING_CHOICE in "${CHANNEL_MAPPING_OPTIONS[@]}" ; do
+        _lookup_audio_mapping "${AUDIO_MAPPING_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+if [[ "${STANDARD_CHOICE}" && "${STANDARD_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_standard "${STANDARD_CHOICE}"
+else
+    _report -q "Which television STANDARD?"
+    PS3="Select a television STANDARD: "
+    select STANDARD_CHOICE in "${STANDARD_OPTIONS[@]}" ; do
+        _lookup_standard "${STANDARD_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+if [[ "${PLAYBACKVIEW_CHOICE}" && "${PLAYBACKVIEW_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_playbackview "${PLAYBACKVIEW_CHOICE}"
+else
+    _report -q "Which playback view?"
+    PS3="Select a playback view: "
+    select PLAYBACKVIEW_CHOICE in "${PLAYBACKVIEW_OPTIONS[@]}" ; do
+        _lookup_playbackview "${PLAYBACKVIEW_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+if [[ "${PLAYBACKVIEW_CHOICE}" = "Full Range Visual" ]] ; then
+    MIDDLEOPTIONS+=(-color_range jpeg)
+else
+    MIDDLEOPTIONS+=(-color_range mpeg)
+fi
+MIDDLEOPTIONS+=(-metadata creation_time=now)
+
+# set up input and playback
+_set_up_drawtext
+_get_decklink_inputs
+GRAB_DECKLINK=(-f decklink)
+GRAB_DECKLINK+=(-draw_bars 0)
+GRAB_DECKLINK+=(-audio_input "${AUDIO_INPUT}")
+GRAB_DECKLINK+=(-video_input "${VIDEO_INPUT}")
+GRAB_DECKLINK+=(-format_code "${STANDARD}")
+GRAB_DECKLINK+=(-channels 8)
+GRAB_DECKLINK+=(-raw_format "${PIXEL_FORMAT}")
+GRAB_DECKLINK+=(-i "${FIRST_DECKLINK_INPUT}")
+PIPE_DECKLINK=(-c copy)
+PIPE_DECKLINK+=(-f nut)
+PIPE_DECKLINK+=(-)
+WINDOW_NAME="mode:${RUNTYPE} - video:'${VIDEO_INPUT_CHOICE}' audio:'${AUDIO_INPUT_CHOICE}' - to end recording press q, esc, or close video window"
+
+# CLI passthrough and audiopassthrough modes
+if [[ "${RUNTYPE}" = "passthrough" ]] ; then
+    _passthrough_mode
+elif [[ "${RUNTYPE}" = "audiopassthrough" ]] ; then
+    _audiopassthrough_mode
+fi
+
+# GUI mode loops
+while [[ "${GUI}" = 1 ]] && [[ "${RUNTYPE}" != "record" ]] ; do
+    if [[ "${RUNTYPE}" = "passthrough" ]] ; then
+        _passthrough_mode
+    elif [[ "${RUNTYPE}" = "audiopassthrough" ]] ; then
+        _audiopassthrough_mode
+    elif [[ "${RUNTYPE}" = "edit" ]] ; then
+        _edit_mode
+    fi
+done
+
+# record mode
+_report -q -n "Enter Identifier: "
+read ID
+if [[ ! -d "${DIR}" ]] ; then
+    _report -q -n "Enter Directory: "
+    read DIR
+    if [[ ! -d "${DIR}" ]] ; then
+        _report -w "Error: Not a valid directory"
+        exit 1
+    fi
+fi
+
+if [[ ! -d "${LOGDIR}" ]] ; then
+    if [[ ! -d "${DIR}" ]] ; then
+        _report -q -n "Enter Directory for Auxiliary Files (If blank will default to recording directory): "
+        read LOGDIR
+    else
+        LOGDIR="${DIR}"
+    fi
+    if [[ ! -d "${LOGDIR}" ]] ; then
+        _report -w "Error: Not a valid directory"
+        exit 1
+    fi
+fi
+
+if [[ -f "${DIR}/${ID}${SUFFIX}.${EXTENSION}" ]] ; then
+    _report -w "A file called ${DIR}/${ID}.${EXTENSION} already exists."
+    _report -w "Exiting to avoid overwriting that file."
+    exit
+fi
+
+if [[ "${CONTAINER_CHOICE}" && "${CONTAINER_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_container "${CONTAINER_CHOICE}"
+else
+    _report -q "Which audiovisual container format?"
+    PS3="Select a container format: "
+    select CONTAINER_CHOICE in "${CONTAINER_OPTIONS[@]}" ; do
+        _lookup_container "${CONTAINER_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+if [[ "${VIDEO_CODEC_CHOICE}" && "${VIDEO_CODEC_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    _lookup_video_codec "${VIDEO_CODEC_CHOICE}"
+else
+    _report -q "Which video codec?"
+    PS3="Select a video codec: "
+    select VIDEO_CODEC_CHOICE in "${VIDEO_CODEC_OPTIONS[@]}" ; do
+        _lookup_video_codec "${VIDEO_CODEC_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+if [[ "${QCTOOLSXML_CHOICE}" != "${UNDECLAREDOPTION}" && "${QCTOOLSXML_CHOICE}" != "Yes" ]] ; then
+    echo ""
+else
+    _report -q "Create QCTools XML?"
+    PS3="Select an option: "
+    select QCTOOLSXML_CHOICE in "${QCTOOLSXML_OPTIONS[@]}" ; do
+        _lookup_qctoolsxml "${QCTOOLSXML_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+if [[ "${QCTOOLSXML_CHOICE}" != "No" && ! "$(command -v qcli)" ]] ; then
+    _report -w "Please install qcli to use the qctools reporting option."
+    _report -w "Such as \`brew install qcli\`."
+    exit 1
+fi
+
+if [[ "${FRAMEMD5_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    echo ""
+else
+    _report -q "Create frame-level MD5 checksums?"
+    PS3="Select an option: "
+    select FRAMEMD5_CHOICE in "${FRAMEMD5_OPTIONS[@]}" ; do
+        _yes_or_no "${FRAMEMD5_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+if [[ "${FRAMEMD5_CHOICE}" = "Yes" ]] ; then
+    FRAMEMD5NAME="${LOGDIR}/${ID}${SUFFIX}.framemd5"
+    EXTRAOUTPUTS=(-an -f framemd5 "${FRAMEMD5NAME}")
+fi
+
+if [[ "${EMBED_LOGS_CHOICE}" != "${UNDECLAREDOPTION}" ]] ; then
+    echo ""
+elif [[ "${EMBED_LOGS_CHOICE}" = "${UNDECLAREDOPTION}" ]] && [[ "${CONTAINER_CHOICE}" = "Matroska" ]] ; then
+    _report -q "Embed logs in Matroska file?"
+    PS3="Select an option: "
+    select EMBED_LOGS_CHOICE in "${EMBED_LOGS_OPTIONS[@]}" ; do
+        _yes_or_no "${EMBED_LOGS_CHOICE}"
+        [[ "${?}" -eq 0 ]] && break
+    done
+fi
+
+_duration_check
+if [[ -n "${DURATION}" ]] ; then
+    DUR_SECONDS=$(bc <<< "${DURATION} * 60")
+    INPUTOPTIONS=(-t "${DUR_SECONDS}")
+fi
+
+if [[ -z "${TECHNICIAN}" ]] ; then
+    _report -q -n "Enter the name of the person digitizing the tape or leave blank: "
+    read TECHNICIAN
+fi
+
+_report -d "Summary: ${PIXEL_FORMAT} bit ${CODECNAME} ${CONTAINER_CHOICE} file from ${STANDARD_CHOICE} ${VIDEO_INPUT_CHOICE} ${AUDIO_INPUT_CHOICE}. Frame MD5s=${FRAMEMD5_CHOICE}, QCTools XML=${QCTOOLSXML_CHOICE}, and Technician=${TECHNICIAN}. Inputs recorded to ${DIR}/${ID}${SUFFIX}.${EXTENSION} and Auxiliary Files created in ${LOGDIR}"
+if [[ "${INVERT_PHASE}" = 1 ]] ; then
+    echo -e " \033[101mWARNING: Option to invert phase of second audio channel has been selected\033[0m"
+fi
+_report -q "Hit enter to start recording"
+read
+
+# create log of vrecord decisions
+INGESTLOG="${LOGDIR}/${ID}_capture_options.log"
+touch "${INGESTLOG}"
+_writeingestlog "computer_name" "$(uname -n)"
+_writeingestlog "user_name" "$(whoami)"
+_writeingestlog "operating_system_VERSION" "$(uname -v)"
+_writeingestlog "vrecord version" "${VERSION}"
+_writeingestlog "datetime_start" "$(_get_iso8601)"
+_writeingestlog "VIDEO_INPUT" "${VIDEO_INPUT_CHOICE}"
+_writeingestlog "AUDIO_INPUT" "${AUDIO_INPUT_CHOICE}"
+_writeingestlog "CONTAINER" "${CONTAINER_CHOICE}"
+_writeingestlog "CODECNAME" "${CODECNAME}"
+_writeingestlog "VIDEO_BIT_DEPTH" "${PIXEL_FORMAT}"
+_writeingestlog "AUDIO_MAPPING_CHOICE" "${AUDIO_MAPPING_CHOICE}"
+_writeingestlog "STANDARD_CHOICE" "${STANDARD_CHOICE}"
+_writeingestlog "QCTOOLSXML_CHOICE" "${QCTOOLSXML_CHOICE}"
+_writeingestlog "FRAMEMD5_CHOICE" "${FRAMEMD5_CHOICE}"
+_writeingestlog "EMBED_LOGS_CHOICE" "${EMBED_LOGS_CHOICE}"
+_writeingestlog "FILE_PATH" "${DIR}/${ID}.${EXTENSION}"
+if [[ -z "${TECHNICIAN}" ]] ; then
+    _writeingestlog "TECHNICIAN" "N/A"
+else
+    _writeingestlog "TECHNICIAN" "${TECHNICIAN}"
+fi
+if [[ "${INVERT_PHASE}" = 1 ]] ; then
+    _writeingestlog "INVERT_PHASE" "Yes"
+fi
+
+_report -d "Close the playback window to stop recording."
+
+# vrecord process!
+if [[ "${MEDIA_PLAYER_CHOICE}" = "mpv" ]] ; then
+    _run "${FFMPEG_DECKLINK[@]}" \
+        2> >(tee "${LOGDIR}/${ID}${CAPTURELOGSUFFIX}" /tmp/vrecord_input.log >/dev/null) \
+        -v info -nostdin -nostats "${INPUTOPTIONS[@]}" "${GRAB_DECKLINK[@]}" \
+        -metadata:s:v:0 encoder="${CODECNAME}" "${MIDDLEOPTIONS[@]}" -c:a pcm_s24le \
+        -filter_complex "[0:v:0]${RECORDINGFILTER}; ${AUDIOMAP}" "${AUDIO_CHANNEL_MAP[@]}" \
+        -f "${FORMAT}" "${DIR}/${ID}${SUFFIX}.${EXTENSION}" \
+        "${EXTRAOUTPUTS[@]}" -map 0 -c copy -f nut - | \
+        if [[ "${QCTOOLSXML_CHOICE}" = "Yes, concurrent with recording" ]] ; then
+            tee >(mpv "${MPVOPTS[@]}" --title="${WINDOW_NAME}" -) | \
+                qcli -i - -o "${LOGDIR}/${ID}${SUFFIX}.${EXTENSION}.qctools.xml.gz"
+        else
+            mpv "${MPVOPTS[@]}" --title="${WINDOW_NAME}" -
+        fi
+else
+    _run "${FFMPEG_DECKLINK[@]}" \
+        2> >(tee "${LOGDIR}/${ID}${CAPTURELOGSUFFIX}" /tmp/vrecord_input.log >/dev/null) \
+        -v info -nostdin -nostats "${INPUTOPTIONS[@]}" "${GRAB_DECKLINK[@]}" \
+        -metadata:s:v:0 encoder="${CODECNAME}" "${MIDDLEOPTIONS[@]}" -c:a pcm_s24le \
+        -filter_complex "[0:v:0]${RECORDINGFILTER}; ${AUDIOMAP}" "${AUDIO_CHANNEL_MAP[@]}" \
+        -f "${FORMAT}" "${DIR}/${ID}${SUFFIX}.${EXTENSION}" \
+        "${EXTRAOUTPUTS[@]}" -map 0 -c copy -f nut - | \
+        if [[ "${QCTOOLSXML_CHOICE}" = "Yes, concurrent with recording" ]] ; then
+            tee >("${FFPLAY_DECKLINK[@]}" \
+                -v info -hide_banner -stats -autoexit -i - \
+                -window_title "${WINDOW_NAME}" \
+                -vf "${PLAYBACKFILTER}" -af "channelmap=0|1:stereo") | \
+                qcli -i - -o "${LOGDIR}/${ID}${SUFFIX}.${EXTENSION}.qctools.xml.gz"
+        else
+            "${FFPLAY_DECKLINK[@]}" \
+                -v info -hide_banner -stats -autoexit -i - \
+                -window_title "${WINDOW_NAME}" \
+                -vf "${PLAYBACKFILTER}" -af "channelmap=0|1:stereo"
+        fi
+fi
+
+_writeingestlog "datetime_end" "$(_get_iso8601)"
+
+# qc tools process
+if [[ "${QCTOOLSXML_CHOICE}" = "Yes, after recording" ]] ; then
+    qcli -i "${LOGDIR}/${ID}${SUFFIX}.${EXTENSION}" -o "${LOGDIR}/${ID}${SUFFIX}.${EXTENSION}.qctools.xml.gz"
+fi
+if [[ "${QCTOOLSXML_CHOICE}" != "No" ]] ; then
+    QCXML="${LOGDIR}/${ID}${SUFFIX}.${EXTENSION}.qctools.xml.gz"
+    _report -d "Vrecord is analyzing your video file. Please be patient."
+    if [[ -s "${QCXML}" ]] ; then
+        if [[ "${PIXEL_FORMAT}" = "yuv422p10" ]] ; then
+            SAT_OUTLIERS=$(gzcat "${QCXML}" | perl -nle 'print if not m{lavfi.(?!signalstats.SATMAX)}' | xml sel -t -v "count(//tag[@key='lavfi.signalstats.SATMAX'][@value>496])" -n)
+        elif [[ "${PIXEL_FORMAT}" = "uyvy422" ]] ; then
+            SAT_OUTLIERS=$(gzcat "${QCXML}" | perl -nle 'print if not m{lavfi.(?!signalstats.SATMAX)}' | xml sel -t -v "count(//tag[@key='lavfi.signalstats.SATMAX'][@value>124])" -n)
+        fi
+        AUD_OUTLIERS=$(gzcat "${QCXML}" | perl -nle 'print if not m{lavfi.(?!astats.Overall.Peak_level)}' | grep -v "tag key=\"lavfi.[^a]" | xml sel -t -v "count(//tag[@key='lavfi.astats.Overall.Peak_level'][@value>=-0.01])" -n)
+        BRNG_OUTLIERS=$(gzcat "${QCXML}" | perl -nle 'print if not m{lavfi.(?!signalstats.BRNG)}' | xml sel -t -v "count(//tag[@key='lavfi.signalstats.BRNG'][@value>=0.03])" -n)
+        AUDIO_PEAK=$(gzcat "${QCXML}" | grep lavfi.astats.Overall.Peak_level | cut -d '"' -f 4 | sort -n | tail -n 1)
+        _writeingestlog "Peak Volume is (dB)" "${AUDIO_PEAK}"
+    else
+        _report -w "qctools XML ${QCXML} is empty or does not exist!"
+    fi
+    if [[ "${SAT_OUTLIERS}" -gt "${SAT_OUTLIER_THRSHLD}" ]] ; then
+        cowsay "$(_report -w "WARNING: Your video file contains ${SAT_OUTLIERS} frames with illegal saturation values. Your deck may require cleaning.")"
+    fi
+    if [[ "${AUD_OUTLIERS}" -gt "${AUD_OUTLIER_THRSHLD}" ]] ; then
+        cowsay "$(_report -w "WARNING: Your video file contains ${AUD_OUTLIERS} frames with clipped audio levels.")"
+    fi
+    if [[ "${BRNG_OUTLIERS}" -gt "${BRNG_OUTLIER_THRSHLD}" ]] ; then
+        cowsay "$(_report -w "WARNING: Your video file contains ${BRNG_OUTLIERS} frames with pixels out of broadcast range.")"
+    fi
+    _report -d "QCTools analysis is complete."
+fi
+
+# check for discontinuities in the Frame MD5s; if user chose not to use Frame MD5s, check for frame discontinuties in the FFmpeg file
+if [[ "${FRAMEMD5_CHOICE}" = "Yes" ]] ; then
+    PTS_DISCONTINUITY=$(cat "${FRAMEMD5NAME}" | grep -v "^#" | cut -d, -f3 | sed 's/ //g' | grep -v "^0$" | awk '$1!=p+1{printf p+1"-"$1-1" "}{p=$1}')
+    if [[ -z "${PTS_DISCONTINUITY}" ]] ; then
+        _writeingestlog "PTS_DISCONTINUITY" "none"
+    else
+        _writeingestlog "PTS_DISCONTINUITY" "${PTS_DISCONTINUITY}"
+        cowsay "$(_report -w "WARNING: There were presentation timestamp discontinuities in the file's frame MD5s for these frame ranges: ${PTS_DISCONTINUITY}. This error may indicate frames dropped by FFmpeg or vrecord. The file may have sync issues.")"
+    fi
+elif [[ "${FRAMEMD5_CHOICE}" = "No" ]] ; then
+    FRAMES_ENCODED=$(cat "${LOGDIR}/${ID}"_ffmpeg_*.log | grep -w "frames encoded" | awk '{print $10}' | grep -m 1 [0-9])
+    FRAMES_DECODED=$(cat "${LOGDIR}/${ID}"_ffmpeg_*.log | grep -w "frames decoded" | awk '{print $10}' | grep -m 1 [0-9])
+    if [[ "${FRAMES_ENCODED}" -lt $((FRAMES_DECODED-1)) ]] ; then
+        FRAMES_DISCREPANCY=$((FRAMES_DECODED-FRAMES_ENCODED))
+        cowsay "$(_report -w "WARNING: There were presentation timestamp discontinuities found in the framemd5s. This error may indicate frames dropped by FFmpeg or vrecord. The file may have sync issues.")" 
+        _writeingestlog "ffmpeg_missing_frames" "${FRAMES_DISCREPANCY}"
+    else
+        _writeingestlog "ffmpeg_missing_frames" "None"
+    fi
+fi
+
+# check for frames dropped in decklink_input.log
+DROPPED_FRAMES_INSTANCES=$(grep -c "Frames dropped" "${LOGDIR}/${ID}${CAPTURELOGSUFFIX}")
+DROPPED_FRAMES_FRAMENUMBERS=$(grep "Frames dropped" "${LOGDIR}/${ID}${CAPTURELOGSUFFIX}" | awk '{print $6}' | sed 's/[(#)]//g')
+if [[ "${DROPPED_FRAMES_INSTANCES}" -gt 0 ]] ; then
+    cowsay "$(_report -w "WARNING: FFmpeg Decklink input reported dropped frames in the following ${DROPPED_FRAMES_INSTANCES} locations. This error may indicate an interrupted signal between hardware components. The file may be missing content.")"
+    for i in ${DROPPED_FRAMES_FRAMENUMBERS} ; do # do not quote this variable
+        DROPPED_FRAMES_TIMESTAMPS+="$(_frames_to_hhmmss "${i}") "
+    done
+    _report -w "Dropped frames timestamps: ${DROPPED_FRAMES_TIMESTAMPS}"
+    _writeingestlog "DROPPED_FRAMES_TIMESTAMPS" "${DROPPED_FRAMES_TIMESTAMPS}"
+fi
+
+# check for input buffer overrun error
+BUFFER_OVERRUN=$(grep -c "Decklink input buffer overrun" "${LOGDIR}/${ID}${CAPTURELOGSUFFIX}")
+if [[ "${BUFFER_OVERRUN}" -gt 0 ]] ; then
+    cowsay "$(_report -w "WARNING: FFmpeg Decklink input reported a buffer overrun. The file is likely missing frames or contains artifacts from the buffer overrun.")"
+    _writeingestlog "Decklink input buffer overrun" "Yes"
+fi
+
+# policy checks with mediaconch
+if [[ "${VIDEO_CODEC_CHOICE}" = "Uncompressed Video" ]] ; then
+    _report -d "Checking file conformance against uncompressed video policy..."
+    STATUS=$(mediaconch -fx -p "${SCRIPTDIR}/vrecord_policy_uncompressed.xml" "${DIR}/${ID}${SUFFIX}.${EXTENSION}" | xmlstarlet sel -N mc="https://mediaarea.net/mediaconch" -t -v mc:MediaConch/mc:media/mc:policy/@outcome -n)
+    if [[ "$STATUS" = "pass" ]] ; then
+        _report -dt "File passed policy check for uncompressed video."
+    elif [[ "$STATUS" = "fail" ]] ; then
+        _report -wt "File did not pass vrecord policy check for uncompressed video and may not conform to digital preservation standards. Try another file?"
+        mediaconch -fx -p "${SCRIPTDIR}/vrecord_policy_uncompressed.xml" "${DIR}/${ID}${SUFFIX}.${EXTENSION}" | xmlstarlet fo > "${DIR}/${ID}${SUFFIX}_mediaconchreport.xml"
+        _report -wt "See ${DIR}/${ID}${SUFFIX}_mediaconchreport.xml for a full MediaConch policy report."
+    else
+        mediaconch -p "${SCRIPTDIR}/vrecord_policy_uncompressed.xml" "${DIR}/${ID}${SUFFIX}.${EXTENSION}"
+    fi
+elif [[ "${VIDEO_CODEC_CHOICE}" = "FFV1 version 3" ]] ; then
+    _report -d "Checking file conformance against FFV1 video policy..."
+    STATUS=$(mediaconch -fx -p "${SCRIPTDIR}/vrecord_policy_ffv1.xml" "${DIR}/${ID}${SUFFIX}.${EXTENSION}" | xmlstarlet sel -N mc="https://mediaarea.net/mediaconch" -t -v mc:MediaConch/mc:media/mc:policy/@outcome -n)
+    if [[ "${STATUS}" = "pass" ]] ; then
+        _report -dt "File passed policy check for FFV1 video."
+    elif [[ "$STATUS" = "fail" ]] ; then
+        _report -wt "File did not pass vrecord policy check for FFV1 video and may not conform to digital preservation standards. Try another file?"
+        mediaconch -fx -p "${SCRIPTDIR}/vrecord_policy_ffv1.xml" "${DIR}/${ID}${SUFFIX}.${EXTENSION}" | xmlstarlet fo > "${DIR}/${ID}${SUFFIX}_mediaconchreport.xml"
+        _report -wt "See ${DIR}/${ID}${SUFFIX}_mediaconchreport.xml for a full MediaConch policy report."
+    else
+        mediaconch -p "${SCRIPTDIR}/vrecord_policy_ffv1.xml" "${DIR}/${ID}${SUFFIX}.${EXTENSION}"
+    fi
+fi
+
+# embed logs in Matroska files
+if [[ "${CONTAINER_CHOICE}" = "Matroska" ]] && [[ "${EMBED_LOGS_CHOICE}" = "Yes" ]] ; then
+    _report -d "Vrecord is attaching logs to your Matroska file:"
+    mkvpropedit "${DIR}/${ID}${SUFFIX}.${EXTENSION}" --attachment-description "Capture options selected by user during vrecord process" --add-attachment "${INGESTLOG}"
+    mkvpropedit "${DIR}/${ID}${SUFFIX}.${EXTENSION}" --attachment-description "Full FFmpeg output from vrecord capture process" --add-attachment "${LOGDIR}/${ID}${CAPTURELOGSUFFIX}"
+    if [[ "${QCTOOLSXML_CHOICE}" = "Yes" ]] ; then
+        mkvpropedit "${DIR}/${ID}${SUFFIX}.${EXTENSION}" --attachment-description "QCTools report from vrecord capture process (zipped XML)" --add-attachment "${QCXML}"
+    fi
+    _report -d "Vrecord is done attaching logs to your Matroska file!"
+fi
